@@ -28,13 +28,13 @@ class SampleListener : Listener
 
     private Object thisLock = new Object();
 
-    private Queue<Vector> positions = new Queue<Vector>();
-    private Queue<Vector> velocities = new Queue<Vector>();
+    private LimitQueue<Vector> positionAverage = new LimitQueue<Vector>(30);
+    private LimitQueue<Vector> velocityAverage = new LimitQueue<Vector>(10);
+    private LimitQueue<float> extraAverage = new LimitQueue<float>(10);
 
-    private Queue<Vector> thumbDistances = new Queue<Vector>();
-    private Queue<Vector> thumbVelocities = new Queue<Vector>();
-
-    private bool thumbDown;
+    private int haltTime = 0;
+    private bool isMouseDown;
+    private Vector lastMousePos = Vector.Zero;
 
     private void SafeWriteLine(String line)
     {
@@ -46,12 +46,22 @@ class SampleListener : Listener
 
     private void sendMouseDown()
     {
-        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+        if (!isMouseDown)
+        {
+            SafeWriteLine("Down");
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            isMouseDown = true;
+        }
     }
 
     private void sendMouseUp()
     {
-        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+        if (isMouseDown)
+        {
+            SafeWriteLine("Up");
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+            isMouseDown = false;
+        }
     }
 
     public override void OnInit(Controller controller)
@@ -83,92 +93,117 @@ class SampleListener : Listener
 
         var screens = controller.CalibratedScreens;
 
-        if (!frame.Fingers.Empty)
+        if (!frame.Hands.Empty)
         {
-            var finger = frame.Fingers[0];
+            var hand = frame.Hands[0];
 
-            var screen = controller.CalibratedScreens.ClosestScreenHit(finger);
+            var screen = controller.CalibratedScreens.FirstOrDefault();
 
             if (screen != null && screen.IsValid)
             {
-                var intersect = screen.Intersect(finger, true);
+                var pos = FindCursorPosition(hand, screen);
 
-                var velocity = finger.TipVelocity;
+                SetCursorPos((int)pos.x, (int)pos.y);
+            }
+        }
+    }
 
-                velocities.Enqueue(velocity);
-                if (velocities.Count > 10)
+    private Vector FindCursorPosition(Hand hand, Screen screen)
+    {
+        if (hand.Fingers.Count > 1)
+        {
+            VelocityClickMethod(hand.Fingers);
+        }
+
+        var position = PalmDirectionMethod(hand, screen);
+        var diff = position - lastMousePos;
+        lastMousePos = position;
+
+        velocityAverage.Enqueue(diff);
+
+        if (Average(velocityAverage).Magnitude > 0.5 && haltTime == 0 || !positionAverage.Any())
+        {
+            positionAverage.Enqueue(position);
+        }
+
+        if (haltTime > 0)
+        {
+            haltTime--;
+        }
+
+        return Average(positionAverage);
+    }
+
+    private Vector PalmDirectionMethod(Hand hand, Screen screen)
+    {
+        var handScreenIntersection = VectorPlaneIntersection(hand.PalmPosition, hand.Direction, screen.BottomLeftCorner, screen.Normal());
+
+        var screenPoint = handScreenIntersection - screen.BottomLeftCorner;
+        var screenPointHorizontal = screenPoint.Dot(screen.HorizontalAxis.Normalized) / screen.HorizontalAxis.Magnitude;
+        var screenPointVertical = screenPoint.Dot(screen.VerticalAxis.Normalized) / screen.VerticalAxis.Magnitude;
+        var screenRatios = new Vector(screenPointHorizontal, screenPointVertical, 0);
+
+        // do some calibration adjustments
+        screenRatios.x = (screenRatios.x - 0.5f) * 1.7f + 0.3f; // increase X sensitivity by 70% and shift left 20%
+        screenRatios.y = (screenRatios.y - 0.5f) * 1.5f + 0.5f; // increase X sensitivity by 50%
+
+        var screenCoords = ToScreen(screenRatios, screen);
+
+        return screenCoords;
+    }
+
+    private Vector ScreenFrustumMethod(Vector handPosition, Screen screen)
+    {
+        var distance = screen.DistanceToPoint(handPosition) + 100;
+
+        var frustumScale = 1 - (distance / 600);
+
+        var scaledPosition = handPosition / frustumScale;
+
+        var screenWidth = screen.HorizontalAxis.Magnitude;
+        var screenHeight = screen.VerticalAxis.Magnitude;
+
+        var normalizedPosition = new Vector(scaledPosition.x / screenWidth + 0.5f, scaledPosition.y / screenHeight - 1f, 0);
+
+        var screenPosition = ToScreen(normalizedPosition, screen);
+
+        return screenPosition;
+    }
+
+    private void VelocityClickMethod(IEnumerable<Finger> fingers)
+    {
+        var fingerVelocity = fingers.Average(f => f.TipVelocity.y);
+
+        var fingerVelocityVariance = fingers.Sum(f => Math.Pow(f.TipVelocity.y - fingerVelocity, 2)) / fingers.Count();
+        var fingerVelocityDeviation = (float)Math.Sqrt(fingerVelocityVariance);
+
+        if (fingerVelocityDeviation > 100)
+        {
+            float greatestDeviation = 0;
+            Finger greatestDeviator = null;
+            foreach (var finger in fingers)
+            {
+                var deviation = Math.Abs(finger.TipVelocity.y - fingerVelocity) / fingerVelocityDeviation;
+
+                if (deviation > greatestDeviation)
                 {
-                    velocities.Dequeue();
+                    greatestDeviation = deviation;
+                    greatestDeviator = finger;
                 }
-                var avgVelocity = new Vector(velocities.Average(v => v.x), velocities.Average(v => v.y), velocities.Average(v => v.z));
+            }
 
-                // use Z to hold weight
-                intersect.z = 1;//Math.Min(1, velocity.Magnitude / 100);
+            if (greatestDeviation > 0.5 && greatestDeviator != null)
+            {
+                // stop mouse movement
+                haltTime = 30;
 
-                var pMag = (positions.Any() ? (ToScreen(intersect, screen) - ToScreen(positions.Last(), screen)).Magnitude : 100);
-
-                if (avgVelocity.Magnitude > 5 || pMag > 50)
+                if (greatestDeviator.TipVelocity.y < 0)
                 {
-                    positions.Enqueue(intersect);
-
-                    if (positions.Count > 10)
-                    {
-                        positions.Dequeue();
-                    }
-
-                    var avgWeight = positions.Average(v => v.z);
-                    var avgX = positions.Average(v => v.x * v.z) / avgWeight;
-                    var avgY = positions.Average(v => v.y * v.z) / avgWeight;
-
-                    var screenPos = ToScreen(new Vector(avgX, avgY, 0), screen);
-
-                    SetCursorPos((int)screenPos.x, (int)screenPos.y);
+                    sendMouseDown();
                 }
                 else
                 {
-                    // not moving
-
-                    if (frame.Fingers.Count > 1)
-                    {
-                        var thumb = frame.Fingers[1];
-
-                        var thumbDist = thumb.TipPosition - finger.TipPosition;
-
-                        if (thumbDistances.Any())
-                        {
-                            var avgThumbDist = Average(thumbDistances);
-
-                            var thumbVelocity = Average(thumbVelocities);
-                            //SafeWriteLine(thumbVelocity.Magnitude.ToString());
-
-                            if (thumbDist.Magnitude < avgThumbDist.Magnitude - 0.5 && !thumbDown && thumbVelocity.Magnitude > 10)
-                            {
-                                thumbDown = true;
-                                SafeWriteLine("Down");
-                                sendMouseDown();
-
-                                thumbDistances.Clear();
-                            }
-                            if (thumbDist.Magnitude > avgThumbDist.Magnitude && thumbDown && thumbVelocity.Magnitude > 10)
-                            {
-                                thumbDown = false;
-                                SafeWriteLine("Up");
-                                sendMouseUp();
-                            }
-                        }
-
-                        thumbDistances.Enqueue(thumbDist);
-                        if (thumbDistances.Count > 10)
-                        {
-                            thumbDistances.Dequeue();
-                        }
-
-                        thumbVelocities.Enqueue(thumb.TipVelocity);
-                        if (thumbVelocities.Count > 5)
-                        {
-                            thumbVelocities.Dequeue();
-                        }
-                    }
+                    sendMouseUp();
                 }
             }
         }
@@ -181,10 +216,37 @@ class SampleListener : Listener
 
     private Vector ToScreen(Vector v, Screen s)
     {
-        var screenX = (int)(v.x * s.WidthPixels);
-        var screenY = (int)(s.HeightPixels - v.y * s.HeightPixels);
+        var screenX = (int)Math.Min(s.WidthPixels, Math.Max(0, (v.x * s.WidthPixels)));
+        var screenY = (int)Math.Min(s.HeightPixels, Math.Max(0, (s.HeightPixels - v.y * s.HeightPixels)));
 
         return new Vector(screenX, screenY, 0);
+    }
+
+    private Vector VectorPlaneIntersection(Vector vectorPoint, Vector vectorDirection, Vector planePoint, Vector planeNormal)
+    {
+        float distance = ((planePoint - vectorPoint).Dot(planeNormal) / (vectorDirection.Dot(planeNormal)));
+
+        return vectorPoint + vectorDirection * distance;
+    }
+}
+
+class LimitQueue<T> : Queue<T>
+{
+    public int Max { get; set; }
+
+    public LimitQueue(int max)
+    {
+        Max = max;
+    }
+
+    public new void Enqueue(T item)
+    {
+        base.Enqueue(item);
+
+        while (Count > Max)
+        {
+            Dequeue();
+        }
     }
 }
 
